@@ -1,0 +1,28 @@
+# Rust build output
+/target/
+
+# Old Gleam build artifacts
+/build/
+
+# Emacs
+*.elc
+*~
+\#*\#
+.dir-locals.el
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test coverage
+/coverage/
+*.lcov
+
+# Logs
+*.log
