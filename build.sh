@@ -21,7 +21,6 @@ check_cmd() {
 }
 
 check_cmd cargo
-check_cmd fd
 
 echo ""
 echo "All dependencies found!"
