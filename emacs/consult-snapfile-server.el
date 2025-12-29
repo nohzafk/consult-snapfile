@@ -106,9 +106,15 @@ Requests older than this are considered stale and cleaned up."
   "Get the server directory."
   (or consult-snapfile-server-directory
       ;; Go up from emacs/ to project root
-      (expand-file-name ".." (file-name-directory
-                               (or load-file-name buffer-file-name
-                                   (locate-library "consult-snapfile-server"))))))
+      (let* ((lib (or load-file-name buffer-file-name
+                      (locate-library "consult-snapfile-server")))
+             (lib-dir (file-name-directory lib))
+             ;; Try .el file (might be symlinked in :local packages) instead of .elc
+             (el-file (concat lib-dir "consult-snapfile-server.el"))
+             (true-path (if (and (not load-file-name) (not buffer-file-name) (file-exists-p el-file))
+                            (file-truename el-file)
+                          lib)))
+        (expand-file-name ".." (file-name-directory true-path)))))
 
 (defun consult-snapfile--find-server-binary ()
   "Find the consult-snapfile-server binary."
