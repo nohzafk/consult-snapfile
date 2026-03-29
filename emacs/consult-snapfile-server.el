@@ -100,6 +100,14 @@ Requests older than this are considered stale and cleaned up."
 (defvar consult-snapfile--stale-check-timer nil
   "Timer for periodic stale request cleanup.")
 
+;;; Utilities
+
+(defun consult-snapfile--message (format-string &rest args)
+  "Log a message like `message', suppressing echo area when minibuffer is active.
+The message is always appended to `*Messages*'."
+  (let ((inhibit-message (minibuffer-window-active-p (minibuffer-window))))
+    (apply #'message format-string args)))
+
 ;;; Server Management
 
 (defun consult-snapfile--server-dir ()
@@ -170,7 +178,7 @@ Requests older than this are considered stale and cleaned up."
 
 (defun consult-snapfile--server-sentinel (process event)
   "Handle server PROCESS EVENT."
-  (message "consult-snapfile server: %s" (string-trim event)))
+  (consult-snapfile--message "consult-snapfile server: %s" (string-trim event)))
 
 ;;; Reconnection Logic
 
@@ -186,10 +194,10 @@ Requests older than this are considered stale and cleaned up."
   (if (>= consult-snapfile--reconnect-attempts consult-snapfile-reconnect-max-attempts)
       (progn
         (setq consult-snapfile--connection-state 'disconnected)
-        (message "consult-snapfile: Max reconnection attempts reached. Use M-x consult-snapfile-connect to retry."))
+        (consult-snapfile--message "consult-snapfile: Max reconnection attempts reached. Use M-x consult-snapfile-connect to retry."))
     (let ((delay (consult-snapfile--reconnect-delay)))
       (setq consult-snapfile--connection-state 'connecting)
-      (message "consult-snapfile: Reconnecting in %.1fs (attempt %d/%d)..."
+      (consult-snapfile--message "consult-snapfile: Reconnecting in %.1fs (attempt %d/%d)..."
                delay (1+ consult-snapfile--reconnect-attempts) consult-snapfile-reconnect-max-attempts)
       (setq consult-snapfile--reconnect-timer
             (run-with-timer delay nil #'consult-snapfile--do-reconnect)))))
@@ -216,7 +224,7 @@ Requests older than this are considered stale and cleaned up."
   "Clear all pending request handlers."
   (let ((count (hash-table-count consult-snapfile--request-handlers)))
     (when (> count 0)
-      (message "consult-snapfile: Clearing %d pending request(s)" count))
+      (consult-snapfile--message "consult-snapfile: Clearing %d pending request(s)" count))
     (clrhash consult-snapfile--request-handlers)
     (clrhash consult-snapfile--request-timestamps)))
 
@@ -244,7 +252,7 @@ Requests older than this are considered stale and cleaned up."
     (dolist (id stale-ids)
       (let ((handler (gethash id consult-snapfile--request-handlers)))
         (when handler
-          (message "consult-snapfile: Request %s timed out after %.1fs"
+          (consult-snapfile--message "consult-snapfile: Request %s timed out after %.1fs"
                    (substring id 0 8) consult-snapfile-request-timeout))
         (consult-snapfile--complete-request id)
         ;; Notify handlers of timeout
@@ -286,7 +294,7 @@ Requests older than this are considered stale and cleaned up."
              :on-open #'consult-snapfile--on-open))
     (error
      (setq consult-snapfile--connection-state 'disconnected)
-     (message "consult-snapfile: Failed to connect: %s" (error-message-string err))
+     (consult-snapfile--message "consult-snapfile: Failed to connect: %s" (error-message-string err))
      (when (and consult-snapfile-auto-reconnect (not consult-snapfile--intentional-disconnect))
        (consult-snapfile--schedule-reconnect)))))
 
@@ -295,7 +303,7 @@ Requests older than this are considered stale and cleaned up."
   (setq consult-snapfile--connection-state 'connected)
   (consult-snapfile--reset-reconnect-state)
   (consult-snapfile--start-stale-check-timer)
-  (message "consult-snapfile: Connected to server"))
+  (consult-snapfile--message "consult-snapfile: Connected to server"))
 
 (defun consult-snapfile--on-close (_ws)
   "Handle WebSocket close."
@@ -304,14 +312,14 @@ Requests older than this are considered stale and cleaned up."
   (consult-snapfile--stop-stale-check-timer)
   (consult-snapfile--clear-pending-requests)
   (if consult-snapfile--intentional-disconnect
-      (message "consult-snapfile: Disconnected from server")
-    (message "consult-snapfile: Connection lost")
+      (consult-snapfile--message "consult-snapfile: Disconnected from server")
+    (consult-snapfile--message "consult-snapfile: Connection lost")
     (when consult-snapfile-auto-reconnect
       (consult-snapfile--schedule-reconnect))))
 
 (defun consult-snapfile--on-error (_ws _type err)
   "Handle WebSocket error ERR."
-  (message "consult-snapfile: WebSocket error: %s" err))
+  (consult-snapfile--message "consult-snapfile: WebSocket error: %s" err))
 
 (defun consult-snapfile--on-message (_ws frame)
   "Handle incoming WebSocket FRAME."
@@ -326,12 +334,12 @@ Requests older than this are considered stale and cleaned up."
   "Dispatch MSG to appropriate handler."
   (let ((type (plist-get msg :type)))
     (pcase type
-      ("ready" (message "consult-snapfile: Server ready (v%s)" (plist-get msg :version)))
+      ("ready" (consult-snapfile--message "consult-snapfile: Server ready (v%s)" (plist-get msg :version)))
       ("pull" (consult-snapfile--handle-pull msg))
       ("results" (consult-snapfile--handle-results msg))
       ("complete" (consult-snapfile--handle-complete msg))
       ("error" (consult-snapfile--handle-error msg))
-      (_ (message "consult-snapfile: Unknown message type: %s" type)))))
+      (_ (consult-snapfile--message "consult-snapfile: Unknown message type: %s" type)))))
 
 ;;; Message Sending
 
@@ -381,7 +389,7 @@ Requests older than this are considered stale and cleaned up."
   (let ((id (plist-get msg :id)))
     (when id
       (consult-snapfile--complete-request id)))
-  (message "consult-snapfile: Error: %s" (plist-get msg :message))
+  (consult-snapfile--message "consult-snapfile: Error: %s" (plist-get msg :message))
   (dolist (handler consult-snapfile--message-handlers)
     (funcall handler 'error msg)))
 
