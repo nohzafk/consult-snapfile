@@ -19,9 +19,6 @@ jobs:
           - os: ubuntu-latest
             name: linux-x86_64
             archive_ext: tar.gz
-          - os: macos-13
-            name: macos-x86_64
-            archive_ext: tar.gz
           - os: macos-14
             name: macos-aarch64
             archive_ext: tar.gz
