@@ -1,4 +1,4 @@
-use crate::protocol::{Request, Response};
+use crate::protocol::{Request, Response, SearchMode};
 use crate::search::SearchEngine;
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
@@ -172,7 +172,7 @@ type WebSocketWriter = Arc<
 
 async fn handle_search(
     id: String,
-    _mode: String,
+    mode: SearchMode,
     query: String,
     cwd: String,
     max_results: usize,
@@ -187,12 +187,15 @@ async fn handle_search(
         return Ok(());
     }
 
-    match engine.search(&query, cwd_path, max_results, &token).await {
+    match engine
+        .search(&query, cwd_path, mode, max_results, &token)
+        .await
+    {
         Ok(Some((results, elapsed_ms))) => {
             // Send results
             let response = Response::Results {
                 id: id.clone(),
-                source: "files".to_string(),
+                source: mode.as_str().to_string(),
                 items: results.clone(),
                 done: true,
             };

@@ -1,5 +1,23 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchMode {
+    Files,
+    Dirs,
+    Paths,
+}
+
+impl SearchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Files => "files",
+            Self::Dirs => "dirs",
+            Self::Paths => "paths",
+        }
+    }
+}
+
 /// Incoming request from Emacs client
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -7,7 +25,7 @@ pub enum Request {
     #[serde(rename = "search")]
     Search {
         id: String,
-        mode: String,
+        mode: SearchMode,
         query: String,
         cwd: String,
         options: SearchOptions,

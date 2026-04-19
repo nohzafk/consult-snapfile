@@ -26,6 +26,7 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'consult)
 (require 'consult-snapfile-server)
 
@@ -51,6 +52,31 @@
 (defvar consult-snapfile--complete nil
   "Non-nil when search is complete.")
 
+(defvar consult-snapfile--current-cwd nil
+  "Absolute path of the current search root.")
+
+(defvar consult-snapfile--current-mode nil
+  "Mode string for the current search request.")
+
+(defun consult-snapfile-project-root ()
+  "Return the current project root as an absolute path."
+  (consult-snapfile--project-root))
+
+(defun consult-snapfile--normalize-mode (mode)
+  "Return MODE as a protocol string."
+  (pcase mode
+    ((or 'files "files" 'nil) "files")
+    ((or 'dirs "dirs") "dirs")
+    ((or 'paths "paths") "paths")
+    (_ (error "consult-snapfile: Unknown mode %S" mode))))
+
+(defun consult-snapfile--mode-label (mode)
+  "Return a user-facing label for MODE."
+  (pcase mode
+    ("dirs" "Directory")
+    ("paths" "Path")
+    (_ "File")))
+
 (defun consult-snapfile--highlight (text indices)
   "Apply highlight face to TEXT at character positions in INDICES.
 INDICES can be a list or vector of character positions."
@@ -69,7 +95,6 @@ INDICES can be a list or vector of character positions."
         ('results
          (let ((items (plist-get msg :items)))
            (when items
-             ;; Convert items to file paths with highlighting
              (let ((files (mapcar (lambda (item)
                                     (let ((text (plist-get item :text))
                                           (indices (plist-get item :indices)))
@@ -79,99 +104,121 @@ INDICES can be a list or vector of character positions."
                                   items)))
                (setq consult-snapfile--results
                      (append consult-snapfile--results files))
-               ;; Call sink with new results
                (when consult-snapfile--sink
                  (funcall consult-snapfile--sink 'flush)
-                 (funcall consult-snapfile--sink consult-snapfile--results))))))
+                 (funcall consult-snapfile--sink
+                          consult-snapfile--results))))))
         ('complete
          (setq consult-snapfile--complete t))
         ('error
          (message "consult-snapfile: %s" (plist-get msg :message)))))))
 
 (defun consult-snapfile--search (query)
-  "Search for files matching QUERY."
-  ;; Cancel previous request if any
+  "Search for entries matching QUERY."
   (when consult-snapfile--current-request-id
-    (consult-snapfile--send `(:type "cancel" :id ,consult-snapfile--current-request-id)))
+    (consult-snapfile--send
+     `(:type "cancel" :id ,consult-snapfile--current-request-id)))
 
-  ;; Reset state
   (setq consult-snapfile--results nil)
   (setq consult-snapfile--complete nil)
   (setq consult-snapfile--current-request-id (consult-snapfile--uuid))
 
-  ;; Send search request
   (consult-snapfile--send
    `(:type "search"
      :id ,consult-snapfile--current-request-id
-     :mode "files"
+     :mode ,consult-snapfile--current-mode
      :query ,query
-     :cwd ,(consult-snapfile--project-root)
+     :cwd ,consult-snapfile--current-cwd
      :options (:max_results ,consult-snapfile-max-results))))
 
-(defun consult-snapfile--async-source (sink)
-  "Async source for consult. SINK is the consult async sink."
+(defun consult-snapfile--make-async-source (sink cwd mode)
+  "Create an async source for SINK using CWD and MODE."
   (lambda (action)
     (pcase action
       ('setup
-       ;; Store sink for message handler
-       (setq consult-snapfile--sink sink)
-       ;; Ensure server connection
+       (setq consult-snapfile--sink sink
+             consult-snapfile--current-cwd cwd
+             consult-snapfile--current-mode mode)
        (consult-snapfile--ensure-connected)
-       ;; Register our message handler
        (consult-snapfile-add-message-handler #'consult-snapfile--message-handler)
-       ;; Initial search with empty query to populate cache
        (consult-snapfile--search "")
-       ;; Pass setup to sink
        (funcall sink 'setup))
       ('destroy
-       ;; Cleanup
        (consult-snapfile-remove-message-handler #'consult-snapfile--message-handler)
-       (setq consult-snapfile--current-request-id nil)
-       (setq consult-snapfile--sink nil)
-       ;; Pass destroy to sink
+       (setq consult-snapfile--current-request-id nil
+             consult-snapfile--sink nil
+             consult-snapfile--current-cwd nil
+             consult-snapfile--current-mode nil)
        (funcall sink 'destroy))
       ((pred stringp)
-       ;; Search query changed
        (consult-snapfile--search action))
       ('flush
-       ;; Flush results to sink
        (funcall sink 'flush))
       ('get
-       ;; Return current results
        consult-snapfile--results)
       (_
-       ;; Pass other actions to sink
        (funcall sink action)))))
 
-(defun consult-snapfile--state ()
-  "State function for file preview."
+(defun consult-snapfile--async-source (sink)
+  "Compatibility async source for file searches.
+SINK is the consult async sink."
+  (consult-snapfile--make-async-source
+   sink
+   (consult-snapfile-project-root)
+   "files"))
+
+(defun consult-snapfile--file-state (root)
+  "Return a preview state function rooted at ROOT."
   (let ((open (consult--temporary-files))
-        (state (consult--file-state))
-        (root (consult-snapfile--project-root)))
+        (state (consult--file-state)))
     (lambda (action cand)
       (unless cand
         (funcall open))
-      ;; Expand relative path to absolute for consult--file-state
       (when cand
         (setq cand (expand-file-name cand root)))
       (funcall state action cand))))
+
+(defun consult-snapfile--state ()
+  "Compatibility state function for file preview."
+  (consult-snapfile--file-state (consult-snapfile-project-root)))
+
+(cl-defun consult-snapfile-read (&key cwd (mode 'files) prompt history category state (require-match t))
+  "Read a project entry from CWD using MODE.
+MODE is one of `files', `dirs', or `paths'."
+  (let* ((root (expand-file-name (or cwd (consult-snapfile-project-root))))
+         (mode (consult-snapfile--normalize-mode mode))
+         (default-directory root))
+    (consult--read
+     (lambda (sink)
+       (consult-snapfile--make-async-source sink root mode))
+     :prompt (or prompt
+                 (format "%s [%s]: "
+                         (consult-snapfile--mode-label mode)
+                         (abbreviate-file-name root)))
+     :sort nil
+     :require-match require-match
+     :category (or category
+                   (when (equal mode "files")
+                     'file))
+     :state (or state
+                (when (equal mode "files")
+                  (consult-snapfile--file-state root)))
+     :history history)))
 
 ;;;###autoload
 (defun consult-snapfile ()
   "Find file in current project with cached file list and fuzzy matching."
   (interactive)
-  (let* ((root (consult-snapfile--project-root))
-         (default-directory root)
+  (let* ((root (consult-snapfile-project-root))
          (prompt (format "File [%s]: " (abbreviate-file-name root)))
-         (selected (consult--read
-                    #'consult-snapfile--async-source
+         (selected (consult-snapfile-read
+                    :cwd root
+                    :mode 'files
                     :prompt prompt
-                    :sort nil  ; Server already sorts by score
-                    :require-match t
+                    :history 'file-name-history
                     :category 'file
-                    :state (consult-snapfile--state)
-                    :history 'file-name-history)))
-    ;; Expand relative path to absolute and strip text properties
+                    :state (consult-snapfile--file-state root)
+                    :require-match t)))
     (find-file (expand-file-name (substring-no-properties selected) root))))
 
 (provide 'consult-snapfile)

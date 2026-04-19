@@ -1,3 +1,4 @@
+use crate::protocol::SearchMode;
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use std::path::Path;
@@ -5,11 +6,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-/// Find files in a directory using the ignore crate.
+/// Find project entries in a directory using the ignore crate.
 /// Respects .gitignore and other ignore files.
 /// Returns None if cancelled.
-pub async fn find_files(
+pub async fn find_entries(
     cwd: &Path,
+    mode: SearchMode,
     max_results: usize,
     token: &CancellationToken,
 ) -> Result<Option<Vec<String>>> {
@@ -42,7 +44,7 @@ pub async fn find_files(
     // Collect more files for cache reusability (10x max_results)
     let max_files = max_results.saturating_mul(10);
     let result = tokio::task::spawn_blocking(move || {
-        let mut files = Vec::new();
+        let mut entries = Vec::new();
 
         let walker = WalkBuilder::new(&cwd)
             .hidden(false) // Include hidden files (like .config)
@@ -66,17 +68,29 @@ pub async fn find_files(
             }
 
             if let Ok(entry) = entry {
-                // Only include files (not directories)
-                if entry.file_type().map_or(false, |ft| ft.is_file()) {
-                    // Get path relative to cwd
+                if let Some(file_type) = entry.file_type() {
                     if let Ok(rel_path) = entry.path().strip_prefix(&cwd) {
-                        let path_str = rel_path.to_string_lossy().to_string();
-                        // Double-check: skip any path containing .git/
-                        if !path_str.contains(".git/") {
-                            files.push(path_str);
+                        if rel_path.as_os_str().is_empty() {
+                            continue;
+                        }
 
-                            // Stop if we have enough files
-                            if files.len() >= max_files {
+                        let path_str = rel_path.to_string_lossy().to_string();
+                        if path_str.contains(".git/") {
+                            continue;
+                        }
+
+                        let candidate = match mode {
+                            SearchMode::Files if file_type.is_file() => Some(path_str),
+                            SearchMode::Dirs if file_type.is_dir() => Some(format!("{}/", path_str)),
+                            SearchMode::Paths if file_type.is_file() => Some(path_str),
+                            SearchMode::Paths if file_type.is_dir() => Some(format!("{}/", path_str)),
+                            _ => None,
+                        };
+
+                        if let Some(candidate) = candidate {
+                            entries.push(candidate);
+
+                            if entries.len() >= max_files {
                                 break;
                             }
                         }
@@ -85,7 +99,7 @@ pub async fn find_files(
             }
         }
 
-        Some(files)
+        Some(entries)
     })
     .await
     .context("Failed to walk directory")?;
@@ -94,6 +108,14 @@ pub async fn find_files(
     cancel_handle.abort();
 
     Ok(result)
+}
+
+pub async fn find_files(
+    cwd: &Path,
+    max_results: usize,
+    token: &CancellationToken,
+) -> Result<Option<Vec<String>>> {
+    find_entries(cwd, SearchMode::Files, max_results, token).await
 }
 
 #[cfg(test)]
@@ -138,5 +160,17 @@ mod tests {
         assert!(!files.iter().any(|f| f.starts_with("target/")));
         // Should not include .git directory
         assert!(!files.iter().any(|f| f.starts_with(".git/") || f.contains("/.git/")));
+    }
+
+    #[tokio::test]
+    async fn test_find_directories() {
+        let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let token = CancellationToken::new();
+        let dirs = find_entries(&cwd, SearchMode::Dirs, 100, &token)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(dirs.iter().any(|entry| entry == "src/"));
+        assert!(dirs.iter().all(|entry| entry.ends_with('/')));
     }
 }

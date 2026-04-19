@@ -1,6 +1,6 @@
 use crate::fd;
 use crate::matcher::FuzzyMatcher;
-use crate::protocol::MatchResult;
+use crate::protocol::{MatchResult, SearchMode};
 use crate::watcher::Watcher;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -10,24 +10,25 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+type CacheKey = (PathBuf, SearchMode);
+
 /// Cache entry for a directory's file list
 #[derive(Clone)]
 struct CacheEntry {
     files: Vec<String>,
-    timestamp: u64,
     last_access: Instant,
 }
 
 /// Tracks fd subprocess execution state
 #[derive(Default)]
 struct FdState {
-    in_progress: HashMap<PathBuf, bool>,
+    in_progress: HashMap<CacheKey, bool>,
     last_invalidation: HashMap<PathBuf, u64>,
 }
 
 /// Search engine with caching and file watching
 pub struct SearchEngine {
-    cache: Arc<Mutex<HashMap<PathBuf, CacheEntry>>>,
+    cache: Arc<Mutex<HashMap<CacheKey, CacheEntry>>>,
     fd_state: Arc<Mutex<FdState>>,
     watcher: Arc<Watcher>,
     max_cache_size: usize,
@@ -49,10 +50,12 @@ impl SearchEngine {
         &self,
         query: &str,
         cwd: PathBuf,
+        mode: SearchMode,
         max_results: usize,
         token: &CancellationToken,
     ) -> Result<Option<(Vec<MatchResult>, u64)>> {
         let start = Instant::now();
+        let cache_key = (cwd.clone(), mode);
 
         // Check cancellation before cache lookup
         if token.is_cancelled() {
@@ -60,7 +63,7 @@ impl SearchEngine {
         }
 
         // Check cache first
-        let files = if let Some(cached_files) = self.get_cache(&cwd).await {
+        let files = if let Some(cached_files) = self.get_cache(&cache_key).await {
             cached_files
         } else {
             // Check cancellation before spawning fd
@@ -68,7 +71,7 @@ impl SearchEngine {
                 return Ok(None);
             }
             // Cache miss - spawn fd
-            match self.fetch_files(&cwd, max_results, token).await {
+            match self.fetch_files(&cwd, mode, max_results, token).await {
                 Ok(Some(files)) => files,
                 Ok(None) => return Ok(None), // Cancelled
                 Err(e) => return Err(e),
@@ -83,16 +86,32 @@ impl SearchEngine {
         // Fuzzy match against files
         // Create a new matcher per search to avoid mutex contention
         let mut matcher = FuzzyMatcher::new();
-        let results = matcher.match_list(query, &files, max_results);
+        let match_limit = if mode == SearchMode::Paths {
+            max_results.saturating_mul(10).min(files.len())
+        } else {
+            max_results
+        };
+        let mut results = matcher.match_list(query, &files, match_limit);
+
+        if mode == SearchMode::Paths {
+            results.sort_by(|a, b| {
+                let a_is_dir = a.text.ends_with('/');
+                let b_is_dir = b.text.ends_with('/');
+                b_is_dir
+                    .cmp(&a_is_dir)
+                    .then_with(|| b.score.cmp(&a.score))
+            });
+            results.truncate(max_results);
+        }
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
         Ok(Some((results, elapsed_ms)))
     }
 
     /// Get files from cache if available
-    async fn get_cache(&self, cwd: &PathBuf) -> Option<Vec<String>> {
+    async fn get_cache(&self, key: &CacheKey) -> Option<Vec<String>> {
         let mut cache = self.cache.lock().await;
-        if let Some(entry) = cache.get_mut(cwd) {
+        if let Some(entry) = cache.get_mut(key) {
             entry.last_access = Instant::now();
             Some(entry.files.clone())
         } else {
@@ -105,13 +124,16 @@ impl SearchEngine {
     async fn fetch_files(
         &self,
         cwd: &PathBuf,
+        mode: SearchMode,
         max_results: usize,
         token: &CancellationToken,
     ) -> Result<Option<Vec<String>>> {
+        let cache_key = (cwd.clone(), mode);
+
         // Check if fd already in progress for this cwd
         {
             let fd_state = self.fd_state.lock().await;
-            if fd_state.in_progress.get(cwd).copied().unwrap_or(false) {
+            if fd_state.in_progress.get(&cache_key).copied().unwrap_or(false) {
                 // Another request is already fetching, use empty list for now
                 return Ok(Some(vec![]));
             }
@@ -120,7 +142,7 @@ impl SearchEngine {
         // Mark fd as in progress
         {
             let mut fd_state = self.fd_state.lock().await;
-            fd_state.in_progress.insert(cwd.clone(), true);
+            fd_state.in_progress.insert(cache_key, true);
         }
 
         let fd_start_time = SystemTime::now()
@@ -132,18 +154,18 @@ impl SearchEngine {
         self.start_watching(cwd).await;
 
         // Spawn fd with cancellation support
-        let files = match fd::find_files(cwd, max_results, token).await {
+        let files = match fd::find_entries(cwd, mode, max_results, token).await {
             Ok(Some(files)) => files,
             Ok(None) => {
                 // Cancelled - mark fd as finished and return
                 let mut fd_state = self.fd_state.lock().await;
-                fd_state.in_progress.insert(cwd.clone(), false);
+                fd_state.in_progress.insert((cwd.clone(), mode), false);
                 return Ok(None);
             }
             Err(e) => {
                 // Error - mark fd as finished and propagate
                 let mut fd_state = self.fd_state.lock().await;
-                fd_state.in_progress.insert(cwd.clone(), false);
+                fd_state.in_progress.insert((cwd.clone(), mode), false);
                 return Err(e);
             }
         };
@@ -151,19 +173,26 @@ impl SearchEngine {
         // Mark fd as finished
         {
             let mut fd_state = self.fd_state.lock().await;
-            fd_state.in_progress.insert(cwd.clone(), false);
+            fd_state.in_progress.insert((cwd.clone(), mode), false);
         }
 
         // Cache the results (with race protection)
-        self.set_cache(cwd, files.clone(), fd_start_time).await;
+        self.set_cache(cwd, mode, files.clone(), fd_start_time).await;
 
         Ok(Some(files))
     }
 
     /// Set cache with race condition protection
-    async fn set_cache(&self, cwd: &PathBuf, files: Vec<String>, fd_start_time: u64) {
+    async fn set_cache(
+        &self,
+        cwd: &PathBuf,
+        mode: SearchMode,
+        files: Vec<String>,
+        fd_start_time: u64,
+    ) {
         let mut cache = self.cache.lock().await;
         let fd_state = self.fd_state.lock().await;
+        let cache_key = (cwd.clone(), mode);
 
         // Check if directory was invalidated after fd started
         if let Some(&last_invalidation) = fd_state.last_invalidation.get(cwd) {
@@ -174,7 +203,7 @@ impl SearchEngine {
         }
 
         // LRU eviction if at capacity
-        if cache.len() >= self.max_cache_size && !cache.contains_key(cwd) {
+        if cache.len() >= self.max_cache_size && !cache.contains_key(&cache_key) {
             if let Some(oldest_path) = cache
                 .iter()
                 .min_by_key(|(_, entry)| entry.last_access)
@@ -184,16 +213,10 @@ impl SearchEngine {
             }
         }
 
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-
         cache.insert(
-            cwd.clone(),
+            cache_key,
             CacheEntry {
                 files,
-                timestamp,
                 last_access: Instant::now(),
             },
         );
@@ -237,7 +260,7 @@ impl SearchEngine {
 
                 // Invalidate cache
                 let mut cache_guard = cache.lock().await;
-                cache_guard.remove(&cwd);
+                cache_guard.retain(|(path, _), _| path != &cwd);
             }
         });
     }
@@ -245,7 +268,7 @@ impl SearchEngine {
     /// Invalidate cache for a directory (for testing)
     pub async fn invalidate_cache(&self, cwd: &PathBuf) {
         let mut cache = self.cache.lock().await;
-        cache.remove(cwd);
+        cache.retain(|(path, _), _| path != cwd);
     }
 
     /// Get cache statistics
@@ -266,12 +289,18 @@ mod tests {
         let token = CancellationToken::new();
 
         // First search (cache miss)
-        let result1 = engine.search("src", cwd.clone(), 10, &token).await.unwrap();
+        let result1 = engine
+            .search("src", cwd.clone(), SearchMode::Files, 10, &token)
+            .await
+            .unwrap();
         let (results1, _elapsed1) = result1.expect("search should not be cancelled");
         assert!(!results1.is_empty());
 
         // Second search (cache hit - should be faster)
-        let result2 = engine.search("test", cwd, 10, &token).await.unwrap();
+        let result2 = engine
+            .search("test", cwd, SearchMode::Files, 10, &token)
+            .await
+            .unwrap();
         let (results2, _elapsed2) = result2.expect("search should not be cancelled");
         assert!(!results2.is_empty());
         // Cache hit should be significantly faster (but not guaranteed in tests)
@@ -284,7 +313,10 @@ mod tests {
         let token = CancellationToken::new();
 
         // Populate cache
-        engine.search("src", cwd.clone(), 10, &token).await.unwrap();
+        engine
+            .search("src", cwd.clone(), SearchMode::Files, 10, &token)
+            .await
+            .unwrap();
         assert_eq!(engine.cache_stats().await.0, 1);
 
         // Invalidate
@@ -301,7 +333,49 @@ mod tests {
         // Cancel before search
         token.cancel();
 
-        let result = engine.search("src", cwd, 10, &token).await.unwrap();
+        let result = engine
+            .search("src", cwd, SearchMode::Files, 10, &token)
+            .await
+            .unwrap();
         assert!(result.is_none(), "cancelled search should return None");
+    }
+
+    #[tokio::test]
+    async fn test_mode_specific_cache_entries() {
+        let engine = SearchEngine::new(10);
+        let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let token = CancellationToken::new();
+
+        engine
+            .search("src", cwd.clone(), SearchMode::Files, 10, &token)
+            .await
+            .unwrap();
+        engine
+            .search("src", cwd, SearchMode::Paths, 10, &token)
+            .await
+            .unwrap();
+
+        assert_eq!(engine.cache_stats().await.0, 2);
+    }
+
+    #[tokio::test]
+    async fn test_paths_mode_prefers_directories() {
+        let engine = SearchEngine::new(10);
+        let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let token = CancellationToken::new();
+
+        let result = engine
+            .search("src", cwd, SearchMode::Paths, 20, &token)
+            .await
+            .unwrap()
+            .expect("search should not be cancelled");
+
+        let (results, _elapsed_ms) = result;
+        let first_file_index = results.iter().position(|item| !item.text.ends_with('/'));
+        let last_dir_index = results.iter().rposition(|item| item.text.ends_with('/'));
+
+        if let (Some(first_file_index), Some(last_dir_index)) = (first_file_index, last_dir_index) {
+            assert!(last_dir_index < first_file_index);
+        }
     }
 }
